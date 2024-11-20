@@ -461,6 +461,23 @@ uniform float SPECULAR_POW <
 	hidden = 1 - DO_REFLECT;
 > = 2.0;
 
+uniform float SPECULAR_ROUGHNESS < 
+    ui_type = "slider";
+    ui_min = 0.1;
+    ui_max = 1.0;
+    ui_label = "Specular Roughness";
+    ui_tooltip = "Controls the roughness of the specular reflection. Lower values make reflections sharper.";
+	hidden = 1 - DO_REFLECT;
+> = 0.5;
+
+uniform float3 F0 < 
+    ui_type = "color";
+    ui_label = "Fresnel Reflectance (F0)";
+    ui_tooltip = "Base reflectivity at normal incidence. Typically, F0 is 0.04 for dielectrics and higher for metals.";
+	hidden = 1 - DO_REFLECT;
+> = float3(0.04, 0.04, 0.04);
+
+
 uniform int TONEMAPPER <
 	ui_type = "combo";
 	ui_items = "ZN Filmic\0Sony A7RIII\0ACES\0Modified Reinhard Jodie\0None\0"; //Contrast\0
@@ -640,7 +657,19 @@ namespace A26{
 		Height = BUFFER_HEIGHT; 
 		Format = RGBA8; MipLevels = 3;
 	};
-	sampler DualFrm {Texture = DualTex;};	
+	sampler DualFrm {Texture = DualTex;};
+
+	texture GITexBounce {
+        Width = BUFFER_WIDTH * ZNRY_RENDER_SCL;
+        Height = BUFFER_HEIGHT * ZNRY_RENDER_SCL;
+        Format = RGBA16F;
+    };
+    sampler GISamBounce {
+        Texture = GITexBounce;
+        MinFilter = POINT;
+        MagFilter = POINT;
+        MipFilter = POINT;
+    };
 }
 
 
@@ -785,6 +814,69 @@ float3 hash3(float3 x)
     return   frac((x.xxy + x.yxx)*x.zyx);
 }
 
+// Helper Functions
+float ggx_distribution(float3 N, float3 H, float roughness)
+{
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float NdotH = max(dot(N, H), 0.0);
+    float NdotH2 = NdotH * NdotH;
+
+    float denom = (NdotH2 * (a2 - 1.0) + 1.0);
+    denom = 3.14159265359 * denom * denom;
+
+    return a2 / denom;
+}
+
+float ggx_geometry(float3 N, float3 V, float3 L, float roughness)
+{
+    float a = roughness * roughness;
+    float k = (a * a) / 2.0;
+
+    float NdotV = max(dot(N, V), 0.0);
+    float NdotL = max(dot(N, L), 0.0);
+
+    float G_V = NdotV / (NdotV * (1.0 - k) + k);
+    float G_L = NdotL / (NdotL * (1.0 - k) + k);
+
+    return G_V * G_L;
+}
+
+float3 fresnel_approx(float3 F0, float HdotV)
+{
+    return F0 + (1.0 - F0) * pow(1.0 - max(HdotV, 0.0), 5.0);
+}
+
+// Specular BRDF Calculation
+float3 calculateSpecular(float3 surfN, float3 V, float3 L)
+{
+    float3 H = normalize(V + L);
+    float D = ggx_distribution(surfN, H, SPECULAR_ROUGHNESS);
+    float G = ggx_geometry(surfN, V, L, SPECULAR_ROUGHNESS);
+    float HdotV = max(dot(H, V), 0.0);
+    float3 F = fresnel_approx(F0, HdotV);
+
+    float3 specularBRDF = (D * G * F) / (4.0 * max(dot(surfN, V), 0.0) * max(dot(surfN, L), 0.0) + 1e-4);
+
+    return specularBRDF;
+}
+
+// Function to calculate View and Light Directions
+void CalculateDirections(float2 texcoord, float3 surfN, float3 lv, out float3 surfNSwapped, out float3 V, out float3 L)
+{
+	float magnitude = length(surfN);
+    float3 normalizedDir = surfN / magnitude;
+    float3 rotatedDir = float3(-normalizedDir.y, normalizedDir.x, normalizedDir.z);
+
+	surfNSwapped = rotatedDir * magnitude;
+
+	float3 surfPos = NorEyePos(texcoord);
+
+    V = normalize(-surfPos);
+    L = normalize(lv);
+}
+
+
 float4 DAMPGI(float2 xy, float2 offset)//offset is noise value, output RGB is GI, A is shadows;
 {
 float2 res = float2(BUFFER_WIDTH, BUFFER_HEIGHT);
@@ -842,7 +934,7 @@ float2 res = float2(BUFFER_WIDTH, BUFFER_HEIGHT);
     		rp.z = d;
     		
     		
-    		//Occlusion calculations
+		//Occlusion calculations
    		 float sh;
    		 if(SHADOW == 0) {sh = 1.0;}
    		 float3 eyeXY	 = eyePos(rp.xy, rp.z);
@@ -874,9 +966,15 @@ float2 res = float2(BUFFER_WIDTH, BUFFER_HEIGHT);
 				   //sh 	+= length(col) / LODS;
 			float  rfs	= 1.0;
 			#if DO_REFLECT
-				float3 vVec = normalize(NorEyePos(xy));
-				float3 rVec = reflect(vVec, surfN);
-				rfs = pow(0.5 + 0.5 * dot(lv, rVec), SPECULAR_POW);
+			
+				float3 V, L;
+				CalculateDirections(xy, surfN, lv, surfN, V, L);
+				
+				float3 specular = calculateSpecular(surfN, V, L);
+				float3 finalColor = col + specular;
+				finalColor += specular * SPECULAR_POW;
+				
+				rfs = finalColor;
 			#endif
 			
 			col *= ed;
@@ -1205,17 +1303,17 @@ float4 PreviousFrame(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV
 float3 DAMPRT(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
 {
 	float3 input = tex2D(ReShade::BackBuffer, texcoord).rgb;
-		   input = saturate(input);
+    input = saturate(input);
 	float4 GI;
 	if(DONT_DENOISE) GI	= saturate(tex2Dlod(A26::UpSam, float4(texcoord, 0, 0)));
 	else 			GI	= tex2Dlod(A26::DualFrm, float4(texcoord, 0, 0));
 	float			depth = ReShade::GetLinearizedDepth(texcoord);
-	if(depth > 0.99) return input;
+    if(depth > 0.99) return input;
 	GI = 1.1 * -GI / (GI - 1.1);
-	
+
 	input = BlendGI(input, GI, depth, texcoord);
-	float3 AmbientFog = pow(SKY_COLOR, 2.2) / exp(pow(15.0 * depth * DEPTH_MASK, 2.0));
-	input = tonemap(input * (1.0 + 5.0 * AmbientFog));
+    float3 AmbientFog = pow(SKY_COLOR, 2.2) / exp(pow(15.0 * depth * DEPTH_MASK, 2.0));
+    input = tonemap(input * (1.0 + 5.0 * AmbientFog));
 	
 	if(DEBUG == 6) {input = GI.rgb;}
 	else if(DEBUG == 7) {input = tex2D(A26::NorSam, texcoord).rgb;}
